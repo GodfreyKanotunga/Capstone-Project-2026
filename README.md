@@ -1,4 +1,4 @@
-# Capstone Project 2025
+# Capstone Project 2026
 
 ## Overview
 A capstone research project focused on data analysis and exploration, 
