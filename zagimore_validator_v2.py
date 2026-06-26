@@ -1,42 +1,26 @@
-"""
-Zagimore ETL Procedure Validator
-=================================
-Author: Godfrey M. Kanotunga
-Project: Capstone-Project-2026
-Clarkson University - Applied Data Science
-
-Description:
-    Discovers all Spring 2026 Zagimore staging databases across both
-    sections, attempts each student's validation stored procedures using
-    a comprehensive fallback list covering all known naming conventions,
-    prints results to the terminal, and saves a consolidated CSV report.
-
-    Section A databases follow the pattern: <username>_S26_ZAGIMORE_DS
-    Section B databases follow the pattern: <username>_Zagimore_DS
-                                         or <username>_ZAGIMORE_DS
-
-Usage:
-    1. Install required library:  pip install mysql-connector-python
-    2. Fill in DB_PASSWORD below
-    3. Connect to Clarkson VPN (FortiClient - Remote Access)
-    4. Run:  python zagimore_validator_v2.py
-"""
-
 import mysql.connector
 import csv
 import datetime
 import sys
 import re
+import os
 
-DB_HOST     = "mysql.clarksonmsda.org"
-DB_PORT     = 3306
-DB_USER     = "kanotugm"
+DB_HOST     = os.environ.get("DB_HOST", "mysql.clarksonmsda.org")
+DB_PORT     = int(os.environ.get("DB_PORT", 3306))
+DB_USER     = os.environ.get("DB_USER", "")
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
 
-OUTPUT_CSV  = r"C:\Users\Godfr\Desktop\ETL-project\validation_report_v2.csv"
+if not DB_USER or not DB_PASSWORD:
+    print("ERROR: DB_USER and DB_PASSWORD environment variables must be set.")
+    sys.exit(1)
+
+OUTPUT_CSV = os.environ.get(
+    "OUTPUT_CSV",
+    os.path.join(os.path.expanduser("~"), "Desktop", "ETL-project", "validation_report_v2.csv")
+)
 
 SECTION_A_RE = re.compile(r'_S26_ZAGIMORE_DS$',        re.IGNORECASE)
 SECTION_B_RE = re.compile(r'(?<!S26)_ZAGIMORE[_]?DS$', re.IGNORECASE)
-
 
 VALIDATION_CHECKS = [
     {
@@ -79,42 +63,21 @@ VALIDATION_CHECKS = [
     },
 ]
 
-
-STATUS_COLUMNS = ["validation_status"]
-
-
+STATUS_COLUMNS    = ["validation_status"]
 DIFFERENCE_COLUMNS = ["source_minus_ds", "ds_minus_dw", "difference", "diff"]
-
-
 SOURCE_COUNT_COLS = ["sourcerowcount", "src_rows", "src_total", "source_total"]
 DS_COUNT_COLS     = ["dsrowcount",     "ds_rows",  "ds_total"]
 DW_COUNT_COLS     = ["dwrowcount",     "dw_rows",  "dw_total"]
 
 
-
-
 def get_connection(database=None):
-    """Open a connection to the MySQL server, optionally selecting a database."""
     params = dict(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD)
     if database:
         params["database"] = database
     return mysql.connector.connect(**params)
 
 
-
-
 def discover_all_databases():
-    """
-    Pull every *ZAGIMORE* database visible to the current user,
-    classify each as Section A or Section B, and return a sorted
-    list of dicts: {username, db_name, section}.
-
-    Operational databases (*_ZAGIMORE) and data warehouse databases
-    (*_ZAGIMORE_DW) are excluded -- only DS staging layers are validated.
-
-    kanotugm_S26_ZAGIMORE_DS is injected explicitly to ensure the
-    current user's own database always appears in results.
-    """
     try:
         conn   = get_connection()
         cursor = conn.cursor()
@@ -130,55 +93,35 @@ def discover_all_databases():
     students = []
     seen     = set()
 
-    
-    own_db = "kanotugm_ZagiClass_DS"
+    own_db = f"{DB_USER}_ZagiClass_DS"
     students.append({"username": DB_USER, "db_name": own_db, "section": "A"})
     seen.add(own_db.lower())
 
     for db in all_dbs:
-        
         if re.search(r'_ZAGIMORE$', db, re.IGNORECASE):
             continue
-        
         if re.search(r'_ZAGIMORE_DW$', db, re.IGNORECASE):
             continue
-        
         if db.lower() in seen:
             continue
 
         if SECTION_A_RE.search(db):
             match = re.match(r'^(.+?)_S26_ZAGIMORE_DS$', db, re.IGNORECASE)
             if match:
-                students.append({
-                    "username": match.group(1),
-                    "db_name":  db,
-                    "section":  "A",
-                })
+                students.append({"username": match.group(1), "db_name": db, "section": "A"})
                 seen.add(db.lower())
 
         elif SECTION_B_RE.search(db):
             match = re.match(r'^(.+?)_ZAGIMORE[_]?DS$', db, re.IGNORECASE)
             if match:
-                students.append({
-                    "username": match.group(1),
-                    "db_name":  db,
-                    "section":  "B",
-                })
+                students.append({"username": match.group(1), "db_name": db, "section": "B"})
                 seen.add(db.lower())
 
-    
     students.sort(key=lambda x: x["username"].lower())
     return students
 
 
-
-
 def try_procedure(cursor, db_name, procedure_names):
-    """
-    Attempt each procedure name in order until one executes successfully.
-    Returns (columns, rows, used_procedure_name, error_message).
-    error_message is None on success; used_procedure_name is None on failure.
-    """
     last_error = None
     for proc_name in procedure_names:
         try:
@@ -189,33 +132,23 @@ def try_procedure(cursor, db_name, procedure_names):
                 pass
             return columns, rows, proc_name, None
         except mysql.connector.Error as e:
-            last_error = str(e)
             try:
                 while cursor.nextset():
                     pass
             except Exception:
                 pass
-            continue
+            if e.errno == 1305:
+                last_error = str(e)
+                continue
+            return [], [], proc_name, str(e)
 
     return [], [], None, last_error
 
 
-
-
 def infer_status(columns, rows):
-    """
-    Infer PASS/FAIL from procedure output when no explicit status column exists.
-
-    Strategy 1 -- difference columns: all difference values must be zero.
-    Strategy 2 -- row count columns: source, DS, and DW totals must match.
-    Strategy 3 -- return UNKNOWN if neither strategy applies.
-
-    Returns (status_string, note_string).
-    """
     cols_lower = [c.lower() for c in columns]
     all_rows   = rows or []
 
-    
     diff_idxs = [cols_lower.index(c) for c in DIFFERENCE_COLUMNS if c in cols_lower]
     if diff_idxs:
         try:
@@ -229,7 +162,6 @@ def infer_status(columns, rows):
         except (ValueError, TypeError):
             pass
 
-    
     src_idx = next((cols_lower.index(c) for c in SOURCE_COUNT_COLS if c in cols_lower), None)
     ds_idx  = next((cols_lower.index(c) for c in DS_COUNT_COLS     if c in cols_lower), None)
     dw_idx  = next((cols_lower.index(c) for c in DW_COUNT_COLS     if c in cols_lower), None)
@@ -256,10 +188,6 @@ def infer_status(columns, rows):
 
 
 def determine_status(columns, rows):
-    """
-    Determine the validation status from procedure output.
-    Returns (status, detail_string, note_string).
-    """
     cols_lower = [c.lower() for c in columns]
     first_row  = rows[0] if rows else []
     detail     = " | ".join(f"{col}={val}" for col, val in zip(columns, first_row))
@@ -274,13 +202,7 @@ def determine_status(columns, rows):
     return status, detail, note
 
 
-
-
 def validate_student(username, db_name, section):
-    """
-    Run all four validation checks for a single student database.
-    Returns a list of result dictionaries.
-    """
     results   = []
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -311,10 +233,15 @@ def validate_student(username, db_name, section):
 
         if error:
             status = "FAIL"
-            note   = "procedure not found"
-            detail = f"No valid procedure found. Last error: {error}"
+            if used_proc:
+                note   = "runtime error -- procedure found but failed"
+                detail = f"Procedure {used_proc} exists but raised error: {error}"
+            else:
+                note   = "procedure not found"
+                detail = f"No valid procedure found. Last error: {error}"
             print(f"\n  [{label}]")
-            print(f"  FAIL -- no matching procedure found")
+            print(f"  FAIL -- {note}")
+            print(f"  {detail}")
         else:
             status, detail, note = determine_status(columns, rows)
             print(f"\n  [{label}]")
@@ -339,7 +266,6 @@ def validate_student(username, db_name, section):
 
 
 def print_summary(all_results):
-    """Print a final summary table to the terminal."""
     print(f"\n{'='*70}")
     print("  FINAL SUMMARY -- IA 605 Spring 2026 (Both Sections)")
     print(f"{'='*70}")
@@ -351,7 +277,6 @@ def print_summary(all_results):
 
 
 def save_to_csv(all_results, filename):
-    """Write all results to a CSV file."""
     fieldnames = [
         "student", "section", "database", "check",
         "procedure", "status", "note", "detail", "timestamp",
@@ -361,7 +286,6 @@ def save_to_csv(all_results, filename):
         writer.writeheader()
         writer.writerows(all_results)
     print(f"Report saved to: {filename}")
-
 
 
 if __name__ == "__main__":
